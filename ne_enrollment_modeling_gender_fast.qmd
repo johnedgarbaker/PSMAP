@@ -1,0 +1,1061 @@
+---
+title: "Northeast enrollment modeling"
+author: "John Baker"
+format:
+  html:
+    code-overflow: wrap
+    embed-resources: true
+---
+
+```{r}
+rm(list = ls())
+```
+
+```{r, packages}
+library(tidyverse)
+library(tidymodels)
+library(leaps)
+library(car)
+library(doParallel)
+```
+
+adding this to speed up code (from AI, code was taking forever)
+
+```{r, speed up code}
+cores = max(1, parallel::detectCores() - 1)
+cl = parallel::makePSOCKcluster(cores)
+registerDoParallel(cl)
+```
+
+```{r, read info}
+ne = read_csv("northeast_census_over_time_modeling_gender.csv",
+col_types = cols(ZIP = col_character(), .default = col_guess())) |>
+    mutate(state = as.factor(state))
+```
+
+```{r, train test}
+set.seed(88)
+
+train_data = ne |> filter(year < 2024)
+test_data = ne |> filter(year == 2024)
+```
+
+```{r, validate grouped by ZIP}
+set.seed(88)
+
+folds_grouped = group_vfold_cv(train_data, group = ZIP, v = 10)
+```
+
+Before doing recipes, let's do some subset work
+
+```{r, ideal reduced model}
+subset_data = train_data |>
+  select(
+    private_k12,
+    # Economic characteristics
+    median_hh_income_inflation_adjusted,
+    median_home_value_inflation_adjusted,
+    # Adult educational attainment
+    pct_adults_hs_plus,
+    pct_adults_bachelors_plus,
+    pct_adults_grad_plus,
+    # Household characteristics
+    total_households,
+    pct_households_with_children,
+    # Child population by age
+    age_0_4,
+    age_5_9,
+    age_10_14,
+    age_15_17,
+    # Gender composition
+    pct_school_age_male)
+
+subset_fit = regsubsets(
+  private_k12 ~ .,
+  data = subset_data,
+  nvmax = 12,
+  method = "exhaustive")
+
+subset_summary = summary(subset_fit)
+subset_comparison = tibble(
+  predictors = 1:12,
+  adjusted_r2 = subset_summary$adjr2,
+  cp = subset_summary$cp,
+  bic = subset_summary$bic)
+
+subset_comparison
+```
+
+Which works best?
+
+```{r}
+best_adjr2 = which.max(subset_summary$adjr2)
+best_cp = which.min(subset_summary$cp)
+best_bic = which.min(subset_summary$bic)
+
+best_adjr2
+best_cp
+best_bic
+
+coef(subset_fit, id = best_adjr2)
+
+coef(subset_fit, id = best_cp)
+
+coef(subset_fit, id = best_bic)
+```
+
+Looks like 11! Will try three models to be sure.
+
+```{r, recipes for OLS}
+
+# Recipe A: All features
+
+recipe_a = recipe(
+  private_k12 ~ median_hh_income_inflation_adjusted + median_home_value_inflation_adjusted +
+    school_age_population + pct_adults_hs_plus + pct_adults_bachelors_plus +
+    pct_adults_grad_plus + total_households + pct_households_with_children + age_0_4 +
+    state,
+  data = train_data) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors())
+
+# Recipe B: 11 numeric predictors + state, no gender
+
+recipe_b = recipe(
+  private_k12 ~ median_hh_income_inflation_adjusted + median_home_value_inflation_adjusted +
+    pct_adults_hs_plus + pct_adults_bachelors_plus + pct_adults_grad_plus + total_households +
+    pct_households_with_children + age_0_4 + age_5_9 + age_10_14 + age_15_17 + state,
+  data = train_data) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors())
+
+# Recipe C: Same as B, no bachelors for parents
+
+recipe_c = recipe(
+  private_k12 ~ median_hh_income_inflation_adjusted + median_home_value_inflation_adjusted +
+    pct_adults_hs_plus + pct_adults_grad_plus + total_households +
+    pct_households_with_children + age_0_4 + age_5_9 + age_10_14 + age_15_17 + state,
+  data = train_data) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors())
+```
+
+```{r, prep and metrics}
+
+missing_a = prep(recipe_a) |>
+  bake(new_data = NULL) |>
+  summarize(across(everything(), ~sum(is.na(.x))))
+
+missing_b = prep(recipe_b) |>
+  bake(new_data = NULL) |>
+  summarize(across(everything(), ~sum(is.na(.x))))
+
+missing_c = prep(recipe_c) |>
+  bake(new_data = NULL) |>
+  summarize(across(everything(), ~sum(is.na(.x))))
+
+missing_a
+missing_b
+missing_c
+
+reg_metrics = metric_set(rmse, rsq, mae)
+reg_metrics
+```
+
+```{r, workflows}
+set.seed(88)
+lr_spec = linear_reg(mode = "regression") |> set_engine("lm")
+
+lr_wf_a = workflow() |> add_recipe(recipe_a) |> add_model(lr_spec)
+lr_wf_b = workflow() |> add_recipe(recipe_b) |> add_model(lr_spec)
+lr_wf_c = workflow() |> add_recipe(recipe_c) |> add_model(lr_spec)
+
+lr_cv_a = fit_resamples(lr_wf_a,
+  resamples = folds_grouped,
+  metrics = reg_metrics,
+  control = control_resamples(save_pred = TRUE))
+lr_cv_b = fit_resamples(lr_wf_b,
+  resamples = folds_grouped,
+  metrics = reg_metrics,
+  control = control_resamples(save_pred = TRUE))
+lr_cv_c = fit_resamples(lr_wf_c,
+  resamples = folds_grouped,
+  metrics = reg_metrics,
+  control = control_resamples(save_pred = TRUE))
+```
+
+```{r, compare OLS metrics}
+linreg_metrics = bind_rows(
+  collect_metrics(lr_cv_a) |> mutate(model = "OLS A - Aggregate ages"),
+  collect_metrics(lr_cv_b) |> mutate(model = "OLS B - Full individual ages"),
+  collect_metrics(lr_cv_c) |> mutate(model = "OLS C - Reduced individual ages")) |>
+  dplyr::select(model, .metric, mean, std_err) |>
+  arrange(.metric, mean)
+
+linreg_metrics
+```
+
+```{r, fit to training data}
+ols_fit_a = lr_wf_a |> fit(data = train_data)
+ols_fit_b = lr_wf_b |> fit(data = train_data)
+ols_fit_c = lr_wf_c |> fit(data = train_data)
+ols_fit_a |> extract_fit_engine() |> summary()
+ols_fit_b |> extract_fit_engine() |> summary()
+ols_fit_c |> extract_fit_engine() |> summary()
+```
+
+I'm curious about outliers.
+
+```{r, outliers}
+extreme_five = c(
+  "08701",  # Lakewood, NJ
+  "11219",  # Brooklyn, NY
+  "10977",  # Spring Valley, NY
+  "10950",  # Monroe, NY
+  "10952")   # Monsey, NY
+
+midatlantic_high = test_data |>
+  filter(state %in% c("DC", "MD", "VA")) |>
+  arrange(desc(private_k12)) |>
+  group_by(state) |>
+  slice_head(n = 3) |>
+  ungroup() |>
+  dplyr::select(ZIP, zip_place_name, state, private_k12, school_age_population)
+
+midatlantic_high
+
+diagnostic_zips = c(extreme_five, midatlantic_high$ZIP) |> unique()
+train_lookup = train_data |>
+  mutate(.row = row_number()) |>
+  dplyr::select(.row, ZIP, year, state, zip_place_name)
+
+pred_a = collect_predictions(lr_cv_a) |>
+  left_join(train_lookup, by = ".row") |>
+  mutate(model = "A - Aggregate ages")
+pred_b = collect_predictions(lr_cv_b) |>
+  left_join(train_lookup, by = ".row") |>
+  mutate(model = "B - Full individual ages")
+pred_c = collect_predictions(lr_cv_c) |>
+  left_join(train_lookup, by = ".row") |>
+  mutate(model = "C - Reduced individual ages")
+
+all_ols_predictions = bind_rows(pred_a, pred_b, pred_c)
+all_ols_predictions = all_ols_predictions |>
+  mutate(market_group = case_when(
+    ZIP %in% extreme_five ~ "Original five extreme ZIPs",
+    ZIP %in% diagnostic_zips ~ "High DC / MD / VA ZIPs",
+    TRUE ~ "Other ZIPs"))
+
+extreme_comparison = all_ols_predictions |>
+  group_by(model, market_group) |>
+  summarize(
+    n = n(),
+    mae = mae_vec(truth = private_k12, estimate = .pred),
+    rmse = rmse_vec(truth = private_k12, estimate = .pred),
+    mean_error = mean(.pred - private_k12),
+    .groups = "drop")
+
+extreme_comparison
+```
+
+```{r}
+zip_comparison = all_ols_predictions |>
+  filter(ZIP %in% diagnostic_zips) |>
+  group_by(model, ZIP, zip_place_name, state) |>
+  summarize(
+    actual_mean = mean(private_k12),
+    predicted_mean = mean(.pred),
+    mean_error = mean(.pred - private_k12),
+    mae = mean(abs(.pred - private_k12)),
+    .groups = "drop") |>
+  arrange(ZIP, model)
+
+zip_comparison
+```
+
+So I have some concerns about multicollinearity here. Let's check!
+
+```{r}
+vif_a = ols_fit_a |>
+  extract_fit_engine() |>
+  car::vif()
+
+vif_c = ols_fit_c |>
+  extract_fit_engine() |>
+  car::vif()
+
+# Compare VIF values
+tibble(
+  variable = names(vif_a),
+  VIF = as.numeric(vif_a)) |>
+  arrange(desc(VIF))
+
+tibble(
+  variable = names(vif_c),
+  VIF = as.numeric(vif_c)) |>
+  arrange(desc(VIF))
+```
+
+Let's try an additional Model D that could improve on these high VIF values
+
+```{r}
+set.seed(88)
+
+recipe_d = recipe(
+  private_k12 ~ median_hh_income_inflation_adjusted + median_home_value_inflation_adjusted +
+    school_age_population + pct_adults_hs_plus + pct_adults_grad_plus +
+    total_households + pct_households_with_children + state,
+  data = train_data) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors())
+
+lr_wf_d = workflow() |>
+  add_recipe(recipe_d) |>
+  add_model(lr_spec)
+
+lr_cv_d = fit_resamples(lr_wf_d,
+  resamples = folds_grouped,
+  metrics = reg_metrics,
+  control = control_resamples(save_pred = TRUE))
+
+ols_fit_d = lr_wf_d |>
+  fit(data = train_data)
+
+vif_d = ols_fit_d |>
+  extract_fit_engine() |>
+  car::vif()
+
+tibble(
+  variable = names(vif_d),
+  VIF = as.numeric(vif_d)) |>
+  arrange(desc(VIF))
+```
+
+```{r}
+linreg_metrics_acd = bind_rows(
+  collect_metrics(lr_cv_a) |>
+    mutate(model = "OLS A - Aggregate ages"),
+
+  collect_metrics(lr_cv_c) |>
+    mutate(model = "OLS C - Reduced individual ages"),
+
+  collect_metrics(lr_cv_d) |>
+    mutate(model = "OLS D - Reduced aggregate ages")
+) |>
+  select(
+    model,
+    .metric,
+    mean,
+    std_err
+  ) |>
+  arrange(.metric, mean)
+
+linreg_metrics_acd
+```
+
+Model D improves upon model A in MAE, but worse in RMSE. I'm curious to use A, C, and D in a regularized regression. We see outliers, especially in towns like Lakewood Township, NJ where a lot of Orthodox Jews live who are far less likely to attend public schools. Model D does not perform as well on the outliers but performs better on most ZIPs. This is more interesting to me, I'd rather it predict 99% right and be off on the outliers that don't follow other patterns.
+
+
+```{r, regularized setup}
+recipe_a_reg = recipe_a |>
+  step_normalize(all_numeric_predictors())
+recipe_c_reg = recipe_c |>
+  step_normalize(all_numeric_predictors())
+recipe_d_reg = recipe_d |>
+  step_normalize(all_numeric_predictors())
+
+reg_spec = linear_reg(mode = "regression", penalty = tune(), mixture = tune()) |>
+  set_engine("glmnet")
+
+# workflows
+
+reg_wf_a = workflow() |> add_recipe(recipe_a_reg) |> add_model(reg_spec)
+reg_wf_c = workflow() |> add_recipe(recipe_c_reg) |> add_model(reg_spec)
+reg_wf_d = workflow() |> add_recipe(recipe_d_reg) |> add_model(reg_spec)
+
+# tuning grid
+
+reg_grid = crossing(
+  penalty = 10^seq(-4, 3, length.out = 20),
+  mixture = c(0, 0.5, 1))
+reg_grid
+```
+
+
+```{r, tuning regularized models}
+set.seed(88)
+
+reg_cv_a = tune_grid(
+  reg_wf_a,
+  resamples = folds_grouped,
+  grid = reg_grid,
+  metrics = reg_metrics,
+  control = control_grid())
+
+reg_cv_c = tune_grid(
+  reg_wf_c,
+  resamples = folds_grouped,
+  grid = reg_grid,
+  metrics = reg_metrics,
+  control = control_grid())
+
+reg_cv_d = tune_grid(
+  reg_wf_d,
+  resamples = folds_grouped,
+  grid = reg_grid,
+  metrics = reg_metrics,
+  control = control_grid())
+```
+
+
+```{r, regularization results}
+autoplot(reg_cv_a)
+autoplot(reg_cv_c)
+autoplot(reg_cv_d)
+
+# best metrics, MAE and RMSE
+
+show_best(reg_cv_a, metric = "mae", n = 5)
+show_best(reg_cv_c, metric = "mae", n = 5)
+show_best(reg_cv_d, metric = "mae", n = 5)
+show_best(reg_cv_a, metric = "rmse", n = 5)
+show_best(reg_cv_c, metric = "rmse", n = 5)
+show_best(reg_cv_d, metric = "rmse", n = 5)
+
+```
+
+
+```{r}
+
+# Finalize the MAE-selected configurations
+
+best_a = select_best(reg_cv_a, metric = "mae")
+best_c = select_best(reg_cv_c, metric = "mae")
+best_d = select_best(reg_cv_d, metric = "mae")
+
+reg_fit_a = reg_wf_a |>
+  finalize_workflow(best_a) |>
+  fit(data = train_data)
+reg_fit_c = reg_wf_c |>
+  finalize_workflow(best_c) |>
+  fit(data = train_data)
+reg_fit_d = reg_wf_d |>
+  finalize_workflow(best_d) |>
+  fit(data = train_data)
+
+# Examine variation in predictions
+
+bind_rows(
+  predict(reg_fit_a, new_data = train_data) |>
+    mutate(model = "A"),
+  predict(reg_fit_c, new_data = train_data) |>
+    mutate(model = "C"),
+  predict(reg_fit_d, new_data = train_data) |>
+    mutate(model = "D")) |>
+  group_by(model) |>
+  summarize(
+    min_prediction = min(.pred),
+    median_prediction = median(.pred),
+    max_prediction = max(.pred),
+    prediction_sd = sd(.pred),
+    .groups = "drop"
+  )
+```
+
+```{r}
+# Training predictions for both models
+
+reg_predictions = bind_rows(
+  train_data |>
+    select(ZIP, year, private_k12) |>
+    bind_cols(predict(reg_fit_a, new_data = train_data)) |>
+    mutate(model = "A"),
+  train_data |>
+    select(ZIP, year, private_k12) |>
+    bind_cols(predict(reg_fit_c, new_data = train_data)) |>
+    mutate(model = "C"),
+   train_data |>
+    select(ZIP, year, private_k12) |>
+    bind_cols(predict(reg_fit_d, new_data = train_data)) |>
+    mutate(model = "D"), )
+
+# Count impossible predictions
+
+reg_predictions |>
+  group_by(model) |>
+  summarize(
+    negative_predictions = sum(.pred < 0),
+    pct_negative = mean(.pred < 0) * 100,
+    .groups = "drop")
+```
+
+```{r}
+reg_metrics_a = collect_metrics(reg_cv_a) |>
+  semi_join(best_a, by = c("penalty", "mixture")) |>
+  mutate(model = "Regularized A")
+reg_metrics_c = collect_metrics(reg_cv_c) |>
+  semi_join(best_c, by = c("penalty", "mixture")) |>
+  mutate(model = "Regularized C")
+reg_metrics_d = collect_metrics(reg_cv_d) |>
+  semi_join(best_d, by = c("penalty", "mixture")) |>
+  mutate(model = "Regularized D")
+
+ols_vs_regularized = bind_rows(
+  collect_metrics(lr_cv_a) |>
+    mutate(model = "OLS A"),
+  collect_metrics(lr_cv_c) |>
+    mutate(model = "OLS C"),
+  collect_metrics(lr_cv_d) |>
+    mutate(model = "OLS D"),
+  reg_metrics_a,
+  reg_metrics_c,
+  reg_metrics_d) |>
+  dplyr::select(model, .metric, mean, std_err) |>
+  arrange(.metric, mean)
+
+ols_vs_regularized
+```
+
+```{r, coef check}
+best_a
+best_c
+best_d
+
+tidy(reg_fit_a) |>
+  filter(term != "(Intercept)") |>
+  arrange(desc(abs(estimate)))
+
+tidy(reg_fit_c) |>
+  filter(term != "(Intercept)") |>
+  arrange(desc(abs(estimate)))
+
+tidy(reg_fit_d) |>
+  filter(term != "(Intercept)") |>
+  arrange(desc(abs(estimate)))
+```
+
+I like, based on MAE and RSQ, Regularized model C most. Interestingly, RMSE and MAE give different best models.
+
+### Ensemble Methods
+
+Let's move on and do our ensemble methods with trees, random forests, and boosting.
+
+```{r, boosting preprocessing}
+tune_xgboost_spec = boost_tree(
+  mode = "regression",
+  trees = tune(),
+  learn_rate = tune(),
+  tree_depth = tune()) |>
+  set_engine("xgboost")
+
+tune_xgboost_wf_a = workflow() |>
+  add_recipe(recipe_a) |>
+  add_model(tune_xgboost_spec)
+tune_xgboost_wf_c = workflow() |>
+  add_recipe(recipe_c) |>
+  add_model(tune_xgboost_spec)
+tune_xgboost_wf_d = workflow() |>
+  add_recipe(recipe_d) |>
+  add_model(tune_xgboost_spec)
+
+xgboost_params_a = extract_parameter_set_dials(tune_xgboost_wf_a) |>
+  update(trees = trees(c(50, 500)),
+    learn_rate = learn_rate(c(-3, -1)),
+    tree_depth = tree_depth(c(1, 5)))
+xgboost_params_c = extract_parameter_set_dials(tune_xgboost_wf_c) |>
+  update(trees = trees(c(50, 500)),
+    learn_rate = learn_rate(c(-3, -1)),
+    tree_depth = tree_depth(c(1, 5)))
+xgboost_params_d = extract_parameter_set_dials(tune_xgboost_wf_d) |>
+  update(trees = trees(c(50, 500)),
+    learn_rate = learn_rate(c(-3, -1)),
+    tree_depth = tree_depth(c(1, 5)))
+
+
+```
+
+```{r, boosting tuning}
+tune_results_xgboost_a = tune_grid(
+  tune_xgboost_wf_a,
+  resamples = folds_grouped,
+  metrics = reg_metrics,
+  grid = grid_random(xgboost_params_a, size = 20))
+tune_results_xgboost_c = tune_grid(
+  tune_xgboost_wf_c,
+  resamples = folds_grouped,
+  metrics = reg_metrics,
+  grid = grid_random(xgboost_params_a, size = 20))
+tune_results_xgboost_d = tune_grid(
+  tune_xgboost_wf_d,
+  resamples = folds_grouped,
+  metrics = reg_metrics,
+  grid = grid_random(xgboost_params_a, size = 20))
+```
+
+```{r, boosting metrics}
+autoplot(tune_results_xgboost_a)
+autoplot(tune_results_xgboost_c)
+autoplot(tune_results_xgboost_d)
+
+show_best(tune_results_xgboost_a, metric = "mae", n = 5)
+show_best(tune_results_xgboost_a, metric = "rmse", n = 5)
+show_best(tune_results_xgboost_a, metric = "rsq", n = 5)
+show_best(tune_results_xgboost_c, metric = "mae", n = 5)
+show_best(tune_results_xgboost_c, metric = "rmse", n = 5)
+show_best(tune_results_xgboost_c, metric = "rsq", n = 5)
+show_best(tune_results_xgboost_d, metric = "mae", n = 5)
+show_best(tune_results_xgboost_d, metric = "rmse", n = 5)
+show_best(tune_results_xgboost_d, metric = "rsq", n = 5)
+
+best_xgboost_a = select_best(tune_results_xgboost_a, metric = "mae")
+best_xgboost_c = select_best(tune_results_xgboost_c, metric = "mae")
+best_xgboost_d = select_best(tune_results_xgboost_d, metric = "mae")
+
+best_xgboost_a
+best_xgboost_c
+best_xgboost_d
+```
+
+We can now move onto random forests
+
+```{r, rf preprocessing}
+tune_rf_spec = rand_forest(
+  mode = "regression",
+  mtry = tune(),
+  min_n = tune(),
+  trees = 300) |>
+  set_engine( "ranger", importance = "impurity", num.threads = 1)
+
+tune_rf_wf_a = workflow() |>
+  add_recipe(recipe_a) |>
+  add_model(tune_rf_spec)
+tune_rf_wf_c = workflow() |>
+  add_recipe(recipe_c) |>
+  add_model(tune_rf_spec)
+tune_rf_wf_d = workflow() |>
+  add_recipe(recipe_d) |>
+  add_model(tune_rf_spec)
+
+processed_train_a = prep(recipe_a) |>
+  bake(new_data = NULL) |>
+  select(-private_k12)
+processed_train_c = prep(recipe_c) |>
+  bake(new_data = NULL) |>
+  select(-private_k12)
+processed_train_d = prep(recipe_d) |>
+  bake(new_data = NULL) |>
+  select(-private_k12)
+
+rf_params_a = extract_parameter_set_dials(tune_rf_wf_a) |>
+  finalize(processed_train_a) |>
+  update(min_n = min_n(c(2, 25)))
+rf_params_c = extract_parameter_set_dials(tune_rf_wf_c) |>
+  finalize(processed_train_c) |>
+  update(min_n = min_n(c(2, 25)))
+rf_params_d = extract_parameter_set_dials(tune_rf_wf_d) |>
+  finalize(processed_train_d) |>
+  update(min_n = min_n(c(2, 25)))
+```
+
+```{r, rf tuning}
+set.seed(88)
+
+tune_results_rf_a = tune_grid(
+  tune_rf_wf_a,
+  resamples = folds_grouped,
+  metrics = reg_metrics,
+  grid = grid_random(rf_params_a, size = 20))
+
+
+```
+
+```{r, tune rd c}
+set.seed(88)
+
+tune_results_rf_c = tune_grid(
+  tune_rf_wf_c,
+  resamples = folds_grouped,
+  metrics = reg_metrics,
+  grid = grid_random(rf_params_c, size = 20))
+```
+
+```{r, tun rf d}
+set.seed(88)
+
+tune_results_rf_d = tune_grid(
+  tune_rf_wf_d,
+  resamples = folds_grouped,
+  metrics = reg_metrics,
+  grid = grid_random(rf_params_d, size = 20))
+```
+
+```{r}
+autoplot(tune_results_rf_a)
+autoplot(tune_results_rf_c)
+autoplot(tune_results_rf_d)
+
+show_best(tune_results_rf_a, metric = "mae", n = 5)
+show_best(tune_results_rf_a, metric = "rmse", n = 5)
+show_best(tune_results_rf_a, metric = "rsq", n = 5)
+show_best(tune_results_rf_c, metric = "mae", n = 5)
+show_best(tune_results_rf_c, metric = "rmse", n = 5)
+show_best(tune_results_rf_c, metric = "rsq", n = 5)
+show_best(tune_results_rf_d, metric = "mae", n = 5)
+show_best(tune_results_rf_d, metric = "rmse", n = 5)
+show_best(tune_results_rf_d, metric = "rsq", n = 5)
+```
+
+Random Forests seem really strong!!! That's good. Let's investigate some more.
+
+```{r}
+best_rf_a = select_best(tune_results_rf_a, metric = "mae")
+best_rf_c = select_best(tune_results_rf_c, metric = "mae")
+best_rf_d = select_best(tune_results_rf_d, metric = "mae")
+
+collect_metrics(tune_results_rf_a) |>
+  semi_join(best_rf_a, by = names(best_rf_a)) |>
+  mutate(model = "RF A")
+
+rf_best_metrics = bind_rows(
+  collect_metrics(tune_results_rf_a) |>
+    semi_join(best_rf_a, by = names(best_rf_a)) |>
+   mutate(model = "RF A"),
+  collect_metrics(tune_results_rf_c) |>
+    semi_join(best_rf_c, by = names(best_rf_c)) |>
+    mutate(model = "RF C"),
+  collect_metrics(tune_results_rf_d) |>
+    semi_join(best_rf_d, by = names(best_rf_d)) |>
+    mutate(model = "RF D"))
+
+rf_best_metrics
+```
+
+Let's try SVM now (at least a radial version of it, already have a linear/non-linear, lets get radial)
+
+```{r}
+set.seed(88)
+
+svm_spec = svm_rbf(
+  mode = "regression",
+  cost = tune(),
+  rbf_sigma = tune()) |>
+  set_engine("kernlab")
+svm_wf_a = workflow() |>
+  add_recipe(recipe_a_reg) |>
+  add_model(svm_spec)
+svm_params_a = extract_parameter_set_dials(svm_wf_a)
+
+tune_results_svm_a = tune_grid(
+  svm_wf_a,
+  resamples = folds_grouped,
+  metrics = reg_metrics,
+  grid = grid_random(svm_params_a, size = 10))
+```
+
+```{r}
+show_best(tune_results_svm_a, metric = "mae", n = 5)
+
+best_svm_a = select_best(
+  tune_results_svm_a,
+  metric = "mae")
+
+collect_metrics(tune_results_svm_a) |>
+  semi_join(
+    best_svm_a,
+    by = names(best_svm_a))
+
+final_svm_wf = svm_wf_a |>
+  finalize_workflow(best_svm_a)
+
+final_svm_fit = final_svm_wf |>
+  fit(data = train_data)
+```
+
+### Predict on testing data
+
+```{r}
+final_linreg_a = lr_wf_a |>
+  fit(data = train_data)
+final_xgboost_a = tune_xgboost_wf_a |>
+  finalize_workflow(best_xgboost_a) |>
+  fit(data = train_data)
+final_rf_a = tune_rf_wf_a |>
+  finalize_workflow(best_rf_a) |>
+  fit(data = train_data)
+final_svm_a = svm_wf_a |>
+  finalize_workflow(best_svm_a) |>
+  fit(data = train_data)
+
+linreg_test = final_linreg_a |>
+  augment(new_data = test_data)
+xgboost_test = final_xgboost_a |>
+  augment(new_data = test_data)
+rf_test = final_rf_a |>
+  augment(new_data = test_data)
+svm_test = final_svm_a |>
+  augment(new_data = test_data)
+```
+
+Now we calculate our metrics
+
+```{r}
+test_results = bind_rows(
+  linreg_test |> 
+    reg_metrics(truth = private_k12, estimate = .pred) |>
+    mutate(model = "Linear Regression"),
+  xgboost_test |>
+    reg_metrics(truth = private_k12, estimate = .pred) |>
+    mutate(model = "XGBoost"),
+  rf_test |>
+    reg_metrics(truth = private_k12, estimate = .pred) |>
+    mutate(model = "Random Forest"),
+  svm_test |>
+    reg_metrics(truth = private_k12, estimate = .pred) |>
+    mutate(model = "RBF SVM"))
+
+test_results
+```
+
+```{r}
+test_results_table = test_results |>
+  dplyr::select(model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  arrange(mae)
+
+test_results_table
+```
+
+```{r}
+rf_test_errors = rf_test |>
+  mutate(
+    error = .pred - private_k12,
+    abs_error = abs(error))
+
+rf_test_errors |>
+  summarize(
+    mean_absolute_error = mean(abs_error),
+    median_absolute_error = median(abs_error),
+    q25_absolute_error = quantile(abs_error, 0.25),
+    q75_absolute_error = quantile(abs_error, 0.75),
+    q90_absolute_error = quantile(abs_error, 0.90))
+
+rf_test_errors = rf_test_errors |>
+  mutate(
+    enrollment_group = case_when(
+      private_k12 < 50 ~ "Under 50",
+      private_k12 < 100 ~ "50-99",
+      private_k12 < 250 ~ "100-249",
+      private_k12 < 500 ~ "250-499",
+      private_k12 < 1000 ~ "500-999",
+      TRUE ~ "1000+"))
+
+rf_test_errors |>
+  group_by(enrollment_group) |>
+  summarize(
+    n = n(),
+    mean_actual = mean(private_k12),
+    mae = mean(abs_error),
+    median_abs_error = median(abs_error),
+    rmse = sqrt(mean(error^2))
+  )
+```
+
+This looks really good once zips get big but not as good for smaller ones.
+It looks like there are likely some predicted negative values, which can't be possible in real life.
+
+```{r}
+rf_test |> summarize(
+  negative_predictions = sum(.pred < 0),
+  pct_negative = mean(.pred < 0) * 100,
+  minimum_prediction = min(.pred))
+
+rf_test
+```
+
+
+```{r}
+
+set.seed(88)
+
+train_data_rate = train_data |>
+  mutate(private_rate = private_k12 / school_age_population)
+
+test_data_rate = test_data |>
+  mutate(private_rate = private_k12 / school_age_population)
+
+folds_grouped_rate = group_vfold_cv(
+  train_data_rate, group = ZIP, v = 10)
+
+recipe_a_rate = recipe(
+  private_rate ~
+    median_hh_income_inflation_adjusted + median_home_value_inflation_adjusted +
+    school_age_population + pct_adults_hs_plus + pct_adults_bachelors_plus +
+    pct_adults_grad_plus + total_households + pct_households_with_children +
+    age_0_4 + state,
+  data = train_data_rate) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors())
+
+rf_rate_spec = rand_forest(
+  mode = "regression",
+  mtry = tune(),
+  min_n = tune(),
+  trees = 300) |>
+  set_engine("ranger", importance = "impurity")
+
+rf_rate_wf = workflow() |>
+  add_recipe(recipe_a_rate) |>
+  add_model(rf_rate_spec)
+rf_rate_prepped = prep(recipe_a_rate)
+rf_rate_num_predictors = rf_rate_prepped |>
+  bake(new_data = NULL) |>
+  select(-private_rate) |>
+  ncol()
+rf_rate_params = extract_parameter_set_dials(rf_rate_wf) |>
+  update(
+    mtry = mtry(c(1, rf_rate_num_predictors)),
+    min_n = min_n(c(2, 25)))
+
+```
+
+Now we tune based on this new data
+
+```{r}
+set.seed(88)
+
+tune_results_rf_rate = tune_grid(
+  rf_rate_wf,
+  resamples = folds_grouped_rate,
+  metrics = reg_metrics,
+  grid = grid_random(
+    rf_rate_params,
+    size = 20))
+
+show_best(tune_results_rf_rate, metric = "mae", n = 5)
+best_rf_rate = select_best(tune_results_rf_rate, metric = "mae")
+best_rf_rate
+
+collect_metrics(tune_results_rf_rate) |>
+  semi_join(
+    best_rf_rate,
+    by = names(best_rf_rate))
+
+final_rf_rate_wf = rf_rate_wf |>
+  finalize_workflow(best_rf_rate)
+
+final_rf_rate = final_rf_rate_wf |>
+  fit(data = train_data_rate)
+```
+
+Now we can predict on 2024 data
+
+```{r}
+rf_rate_test = final_rf_rate |>
+  augment(new_data = test_data_rate) |>
+  mutate(.pred_count = .pred * school_age_population)
+rf_rate_test_metrics = rf_rate_test |>
+  reg_metrics(truth = private_k12, estimate = .pred_count)
+rf_rate_test_metrics
+
+rf_rate_comparison = bind_rows(
+  rf_test |>
+    reg_metrics(truth = private_k12, estimate = .pred) |>
+    mutate(model = "RF Raw Count"),
+  rf_rate_test |>
+    reg_metrics(truth = private_k12, estimate = .pred_count) |>
+    mutate(model = "RF Rate")) |>
+    dplyr::select(model, .metric, .estimate) |>
+    pivot_wider(
+      names_from = .metric,
+      values_from = .estimate)
+
+rf_rate_comparison
+```
+
+This should really help our tails, as the outliers from the previous model were really off.
+
+```{r}
+rf_rate_errors = rf_rate_test |>
+  mutate(
+    error = .pred_count - private_k12,
+    abs_error = abs(error))
+
+rf_rate_errors |>
+  summarize(
+    mean_absolute_error = mean(abs_error),
+    median_absolute_error = median(abs_error),
+    q25_absolute_error = quantile(abs_error, 0.25),
+    q75_absolute_error = quantile(abs_error, 0.75),
+    q90_absolute_error = quantile(abs_error, 0.90))
+```
+
+It does better with the outliers, hooray! The Random Forest capturing rate of private school enrollment rather than raw count is strongest.
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+Stop our clustering!
+
+```{r}
+parallel::stopCluster(cl)
+```
+
+```{r}
+dataframe = read_csv("northeast_census_data_gender.csv")
+```
+
+```{r}
+ne = ne |>
+  mutate(actual_private_rate = private_k12 / school_age_population)
+
+rf_rate_features = rf_rate_test |>
+  transmute(ZIP, year, projected_private_rate = .pred, projected_private_k12 = .pred_count)
+
+ne = ne |>
+  left_join(rf_rate_features, by = c("ZIP", "year"))
+```
+
+```{r}
+write_csv(ne, 'northeast_data_modeling_final.csv')
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
